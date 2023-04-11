@@ -3,14 +3,19 @@ import torch.nn as nn
 import torch
 import numpy as np
 import cv2
+from math import * 
+
 
 # *** constants *** 
 
-LR = 3e-4
+LR = 0.0001 
 EPOCHS = 100 
 IMG_SIZE = 224 # will try 299 later.
-MAX_IMG_PER_FOLDER = 32 # we need to limit this ,cause M1 is not that powerful.
-BSIZE = 12
+MAX_IMG_PER_FOLDER = int(os.getenv("MAXIMG")) # we need to limit this ,cause M1 is not that powerful.
+BSIZE = int(os.getenv("BSIZE"))
+NUM_OF_CLASSES = 25
+
+
 def load_and_scale_image(xpath):
     img = cv2.imread(xpath)
     img = cv2.resize(img,(IMG_SIZE,IMG_SIZE))
@@ -50,6 +55,17 @@ class Dataset(torch.utils.data.Dataset):
         return self.x[d],self.y[d]
 
 
+class StohasticDepth(nn.Module):
+    def __init__(self,prob=0.8) -> None:
+        super().__init__()
+        self.p = prob
+
+    def forward(self,x):
+        self.rand = torch.randn(x.shape[0],1,1,1) < self.p
+
+        x = torch.div(x,self.p) * self.rand
+        return x
+
 """
 
     How does vector database work?
@@ -85,6 +101,73 @@ class Dataset(torch.utils.data.Dataset):
 # Biggest help i ever got in my entire life for the actual MBConv block : 
 # https://paperswithcode.com/method/inverted-residual-block 
 
+class ConvBlock(nn.Module):
+
+    def __init__(self,inputd,outputd,kern_size=3,stride=1,padding=0,groups=1,bn=True,act=True,bias=False) -> None:
+        super(ConvBlock,self).__init__()  
+        self.cd = inputd
+        self.outd = outputd
+        self.c1 = nn.Conv2d(inputd,outputd,kernel_size=kern_size,stride=stride,padding=padding,groups=groups,bias=bias)
+        self.bn = nn.Identity() if bn == False else nn.BatchNorm2d(outputd)
+        self.act =nn.Identity() if act == False else nn.SiLU()
+
+
+    
+    def forward(self,x):
+ 
+        x = self.c1(x)
+        x = self.bn(x)
+        x = self.act(x)
+     
+        return x
+    
+
+
+
+class MBConvN(nn.Module):
+    def __init__(self,nin,nout,ksize=3,stride=1,expansion=6,R=4,survival_prob=0.8  ) -> None:
+        super(MBConvN,self).__init__()  
+
+        padding = (ksize-1)//2
+        inter_channels=int(nin*expansion)
+
+        self.nin = nin 
+        self.nout = nout
+        self.expand = nn.Identity() if(expansion == 6) else ConvBlock(nin,inter_channels,kern_size=1)
+        if(expansion == 6):
+           
+            self.depthwise= ConvBlock(nin,inter_channels,kern_size=ksize,stride=stride,padding=padding,groups= nin)
+        else:
+
+            self.depthwise= ConvBlock(inter_channels,inter_channels,kern_size=ksize,stride=stride,padding=padding,groups= inter_channels)
+        
+        self.se= SEBlock(R,input_shape=inter_channels)
+        self.skip_connection = (stride ==1 and nin == nout)
+        self.drop_layer = StohasticDepth(prob=survival_prob)
+        self.pointwise = ConvBlock(inter_channels,nout,kern_size=1,act=False)
+
+    def forward(self,x):
+
+        emd = x 
+        
+        x = self.expand(x)
+        
+        x = self.depthwise(x)
+        
+        x = self.se(x)
+        
+        x = self.pointwise(x)
+       # print(self,"NIN:",self.nin,"NOUT:",self.nout)
+        if(self.skip_connection):
+
+            x = self.drop_layer(x)
+            x+=emd
+
+        return x
+
+
+
+
 class SEBlock(nn.Module):
     def __init__(self,ratio,input_shape) -> None:
         super(SEBlock,self).__init__()  
@@ -92,159 +175,99 @@ class SEBlock(nn.Module):
         
         self.ratio = ratio
         self.pool = nn.AdaptiveAvgPool2d(1)
+        self.se = nn.Sequential(
+                    nn.AdaptiveAvgPool2d(1),
+                    nn.Conv2d(input_shape, input_shape//ratio, kernel_size=1),
+                    nn.SiLU(),
+                    nn.Conv2d(input_shape//ratio, input_shape, kernel_size=1),
+                    nn.Sigmoid()
+                )
 
-        self.l1 =nn.Linear(input_shape,input_shape//ratio,bias=False)
-        self.l2 =nn.Linear(input_shape//ratio,input_shape,bias=False)
-        self.sig = nn.Sigmoid()
-        self.relu = nn.ReLU(inplace=True)
-
-
-
-    
-    def forward(self,inputx):
-
-        b,c,_,_ = inputx.shape
-        x= self.pool(inputx)
-        x = x.view(b,c)
-
-        x = self.l1(x)
-        x = self.relu(x)
-        x = self.l2(x)
-        x = self.sig(x)
-
-        x = x.view(b,c,1,1)
-        x = inputx*x
-
-        return x
-
-
-
-class MBConv1(nn.Module):
-    def __init__(self,ksize) -> None:
-        super(MBConv1,self).__init__()  
-
-        self.swish = nn.SiLU()
-        self.sig =nn.Sigmoid()
-        self.dwc_1 = nn.Conv2d(32,16,kernel_size=ksize,stride=2,padding=1,groups=4)
-        self.bn = nn.BatchNorm2d(16)
-        self.se = SEBlock(ratio=4,input_shape=16)
-        self.cn = nn.Conv2d(16,24,ksize,1,1)
-        self.bnd = nn.BatchNorm2d(24)
 
     
     def forward(self,x):
 
-        x = x.reshape(BSIZE,32,224,224)
-        x = self.swish(self.bn(self.dwc_1(x)))
-        x= self.se(x)
-        x = self.cn(x)
-        x = self.bnd(x)
-        
-        return x
+        y=self.se(x)       
+        return x*y
 
-
-
-class MBConv6(nn.Module):
-    def __init__(self,input_shape,output_shape,ksize,st,pad) -> None:
-        super(MBConv6,self).__init__()  
-
-        self.c1 = nn.Conv2d(input_shape,output_shape,kernel_size=ksize,stride=1,padding=pad)
-        self.bn = nn.BatchNorm2d(output_shape)
-
-        self.swish = nn.SiLU()
-
-        self.dwc_1 = nn.Conv2d(output_shape,output_shape,kernel_size=(ksize,ksize),stride=st,padding=pad,groups=4)
-        self.bnd = nn.BatchNorm2d(output_shape)
-
-        self.se = SEBlock(ratio=4,input_shape=output_shape)
-
-
-        self.cn = nn.Conv2d(output_shape,output_shape,kernel_size=ksize,stride=1,padding=pad)
-        self.bnd2 = nn.BatchNorm2d(output_shape)
-
-
-    def forward(self,x):
-   
-        x= self.swish(self.bn(self.c1(x)))
-        x = self.swish(self.bnd(self.dwc_1(x)))
-        x = self.se(x)
-        x= self.cn(x)
-        x = self.bnd2(x)
-       
-        return x
-
-
+b0   =  (1.0, 1.0, 224, 0.2)
 
 class EfficientNet(nn.Module):
-    def __init__(self) -> None:
+    
+    def __init__(self,width_m,height_m,dropout) -> None:
         super().__init__()
-        #will return 32,224,224 ? 
-        self.c1 = nn.Conv2d(3,32,3,1,1)
-        self.rel = nn.ReLU() 
-        self.mb1 = MBConv1(3)
-
-        #112x112
-        self.mb6_1 = nn.ModuleList([MBConv6(24,24,3,1,1) for i in range(2)])
-
-        #56x56
-        self.mb6_2 = nn.ModuleList([MBConv6(24,40,5,1,2),MBConv6(40,40,5,2,1)])
-
-        #28x28
-        self.mb6_3 = nn.ModuleList([MBConv6(40,80,3,1,1),MBConv6(80,80,3,2,1),MBConv6(80,80,3,1,1)])
+        width_m= 1.0 
+        height_m= 1.0 
+        dropout = 0.2
         
-        #14x14
-        self.mb6_4 = nn.ModuleList([MBConv6(80,112,5,1,1),MBConv6(112,112,5,1,2),MBConv6(112,112,5,1,2)])
-
-        #14x14
-        self.mb6_5 = nn.ModuleList([MBConv6(112,192,5,1,5),MBConv6(192,192,5,1,5),MBConv6(192,192,5,1,3),MBConv6(192,192,5,1,3)])
-
-        #7x7
-        self.mb6_6 = nn.ModuleList([MBConv6(192,320,3,2,1)])
-
-        self.cfinal =nn.Conv2d(320,320,1,1,1)
-        self.pool =nn.AdaptiveAvgPool2d(1)
-        self.fc= nn.Linear(320*BSIZE,128*BSIZE)
-        self.fc2= nn.Linear(128*BSIZE,64*BSIZE)
-        self.fc3= nn.Linear(64*BSIZE,25*BSIZE)
-
-
-
-
-        self.act_out = nn.Softmax(dim=0)
-        self.swish= nn.SiLU()
+        last_channel = ceil(1280*width_m)
+        self.lc = last_channel
+        self.features = self.create_features(width_m,height_m,last_channel)
+        
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.classify = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(last_channel,NUM_OF_CLASSES)
+        )
 
     def forward(self,x):
-        x = self.c1(x)
-        x= self.swish(x)
-        x = self.mb1(x) 
-        #exit(1)
-        for mb6 in self.mb6_1:
-            x = mb6(x)
-      
-        for mb6 in self.mb6_2:
-            x = mb6(x)
-       
-        for mb6 in self.mb6_3:
-            x = mb6(x)
-
-        for mb6 in self.mb6_4:
-            x = mb6(x)
-        for mb6 in self.mb6_5:
-            x = mb6(x)
-
-        for mb6 in self.mb6_6:
-            x = mb6(x)
-
-
-        x =self.cfinal(x)
-        x = self.pool(x).view(-1)
-        x = self.fc(x)
-        x = self.fc2(x)
-        x = self.fc3(x).reshape(BSIZE,25)
-
+        print(self.lc)
+        print("apply layers...") 
+        x =self.features(x)
+        x = self.pool(x)
+        print(x.shape)
+        x =x.reshape(BSIZE,self.lc)
+        x = self.classify(x)
+        print(x.shape)
 
 
         return x
+
+    def create_features(self,w,h,lc):
+        channels = 4*ceil(int(32*w) / 4)
+        
+        #defined in paper, im too lazy to do this myself so i copied it from some random implementation.
+        layers =[ConvBlock(3,channels,kern_size=3,stride=2,padding=1)] 
+
+        in_channels = channels
+        
+        kernels = [3, 3, 5, 3, 5, 5, 3]
+        expansions = [1, 6, 6, 6, 6, 6, 6]
+        num_channels = [16, 24, 40, 80, 112, 192, 320]
+        num_layers = [1, 2, 2, 3, 3, 4, 1]
+        strides =[1, 2, 2, 2, 1, 2, 1]
+
+        scaled_num_channels = [4*ceil(int(c*w) / 4) for c in num_channels]
+        scaled_num_layers = [int(d * h) for d in num_layers]
+    
+        for i in range(len(scaled_num_channels)):
+            
+            print(in_channels,scaled_num_channels[i])
+            if(scaled_num_layers[i] <=1):
+
+                lay= MBConvN(in_channels,scaled_num_channels[i],kernels[i],strides[i],expansions[i],4,0.8)
+                
+                in_channels = scaled_num_channels[i]
+                layers.append(lay)
+            elif scaled_num_layers[i] > 1:
+                dmad =[] 
+                
+                lay= MBConvN(in_channels,scaled_num_channels[i],kernels[i],strides[i],expansions[i],4,0.8)
+                
+                dmad.append(lay)
+
+                for _ in range(scaled_num_layers[i]):
+                    l2= MBConvN(scaled_num_channels[i],scaled_num_channels[i],kernels[i],strides[i],expansions[i],4,0.8)
+                    dmad.append(l2)
+                
+                for module in dmad:
+                    layers.append(module)
+                in_channels = scaled_num_channels[i]
+
+     
+        layers.append(ConvBlock(in_channels, lc, kern_size = 1, stride = 1, padding = 0))
+    
+        return nn.Sequential(*layers)
 
 
 def train_EfficientNet():
@@ -252,7 +275,7 @@ def train_EfficientNet():
     loss = nn.CrossEntropyLoss()
 
     data =Dataset()
-    net = EfficientNet()
+    net = EfficientNet(b0[0],b0[1],b0[3])
     img = load_and_scale_image("./crap.png").reshape(3,IMG_SIZE,IMG_SIZE)
     loader = torch.utils.data.DataLoader(data,batch_size=BSIZE,shuffle=True)
     #net(img)
@@ -264,20 +287,14 @@ def train_EfficientNet():
         nrm = 0 
 
         for b,(x,y) in enumerate(loader):
-            x = x.reshape(BSIZE,3,IMG_SIZE,IMG_SIZE)
-           
 
+            x = x.reshape(BSIZE,3,IMG_SIZE,IMG_SIZE)           
             out = net(x).reshape(BSIZE,25)
-         #   print(out)
             kdo = torch.argmax(out.clone()[0].cpu().detach(),axis=-1)
             y=y.view(-1).long()
- #           print(y)
-#            print(y.shape)
-
-            #print(out.shape)
-        #    exit(1)
+ 
             optimizer.zero_grad()
-            print(y[0],kdo)
+
             ls = loss(out,y)
  
             ls.backward()
@@ -293,5 +310,6 @@ assert(env != None)
 env = int(env)
 if(env == 1):
     train_EfficientNet()
+
 
 

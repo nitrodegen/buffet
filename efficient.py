@@ -4,68 +4,7 @@ import torch
 import numpy as np
 import cv2
 from math import * 
-
-
-# *** constants *** 
-
-LR = 0.0001 
-EPOCHS = 100 
-IMG_SIZE = 224 # will try 299 later.
-MAX_IMG_PER_FOLDER = int(os.getenv("MAXIMG")) # we need to limit this ,cause M1 is not that powerful.
-BSIZE = int(os.getenv("BSIZE"))
-NUM_OF_CLASSES = 25
-
-
-def load_and_scale_image(xpath):
-    img = cv2.imread(xpath)
-    img = cv2.resize(img,(IMG_SIZE,IMG_SIZE))
-    return np.array(img,dtype=np.float32)
-
-
-class Dataset(torch.utils.data.Dataset):
-    def __init__(self) -> None:
-        super().__init__()
-        self.x = [] 
-        self.y = [] 
-
-        dir = os.listdir("./train.X1")
-    
-        omk = 0 
-
-
-        for folder in dir:
-            folder_dir = os.listdir("./train.X1/"+folder)
-            
-            for i in range(MAX_IMG_PER_FOLDER):
-                img = folder_dir[i]
-                img = load_and_scale_image("./train.X1/"+folder+"/"+img)
-                self.x.append(img)
-                self.y.append(np.array([omk]))
-                
-            omk+=1
-
-
-        self.x = torch.tensor(np.array(self.x)).float()
-        self.y = torch.tensor(np.array(self.y)).float()
-
-    def __len__(self):
-        return self.x.shape[0]
-
-    def __getitem__(self,d):
-        return self.x[d],self.y[d]
-
-
-class StohasticDepth(nn.Module):
-    def __init__(self,prob=0.8) -> None:
-        super().__init__()
-        self.p = prob
-
-    def forward(self,x):
-        self.rand = torch.randn(x.shape[0],1,1,1) < self.p
-
-        x = torch.div(x,self.p) * self.rand
-        return x
-
+from data_api import * 
 """
 
     How does vector database work?
@@ -98,6 +37,19 @@ class StohasticDepth(nn.Module):
 
 
 """
+
+
+class StohasticDepth(nn.Module):
+    def __init__(self,prob=0.8) -> None:
+        super().__init__()
+        self.p = prob
+
+    def forward(self,x):
+        self.rand = torch.randn(x.shape[0],1,1,1) < self.p
+
+        x = torch.div(x,self.p) * self.rand
+        return x
+
 # Biggest help i ever got in my entire life for the actual MBConv block : 
 # https://paperswithcode.com/method/inverted-residual-block 
 
@@ -121,8 +73,6 @@ class ConvBlock(nn.Module):
      
         return x
     
-
-
 
 class MBConvN(nn.Module):
     def __init__(self,nin,nout,ksize=3,stride=1,expansion=6,R=4,survival_prob=0.8  ) -> None:
@@ -186,15 +136,15 @@ class SEBlock(nn.Module):
 
     
     def forward(self,x):
-
         y=self.se(x)       
         return x*y
+
 
 b0   =  (1.0, 1.0, 224, 0.2)
 
 class EfficientNet(nn.Module):
     
-    def __init__(self,width_m,height_m,dropout) -> None:
+    def __init__(self,width_m,height_m,dropout,num_of_images) -> None:
         super().__init__()
         width_m= 1.0 
         height_m= 1.0 
@@ -205,21 +155,24 @@ class EfficientNet(nn.Module):
         self.features = self.create_features(width_m,height_m,last_channel)
         
         self.pool = nn.AdaptiveAvgPool2d(1)
+    
         self.classify = nn.Sequential(
-            nn.Dropout(dropout),
+            nn.Dropout(dropout),        
             nn.Linear(last_channel,NUM_OF_CLASSES)
         )
+    
+        self.noi = num_of_images    
+     
+
 
     def forward(self,x):
-        print(self.lc)
-        print("apply layers...") 
+
         x =self.features(x)
+
         x = self.pool(x)
-        print(x.shape)
+       
         x =x.reshape(BSIZE,self.lc)
         x = self.classify(x)
-        print(x.shape)
-
 
         return x
 
@@ -241,8 +194,8 @@ class EfficientNet(nn.Module):
         scaled_num_layers = [int(d * h) for d in num_layers]
     
         for i in range(len(scaled_num_channels)):
-            
-            print(in_channels,scaled_num_channels[i])
+
+         #   print(in_channels,scaled_num_channels[i])
             if(scaled_num_layers[i] <=1):
 
                 lay= MBConvN(in_channels,scaled_num_channels[i],kernels[i],strides[i],expansions[i],4,0.8)
@@ -275,11 +228,10 @@ def train_EfficientNet():
     loss = nn.CrossEntropyLoss()
 
     data =Dataset()
-    net = EfficientNet(b0[0],b0[1],b0[3])
+    net = EfficientNet(b0[0],b0[1],b0[3],len(data.x))
     img = load_and_scale_image("./crap.png").reshape(3,IMG_SIZE,IMG_SIZE)
     loader = torch.utils.data.DataLoader(data,batch_size=BSIZE,shuffle=True)
-    #net(img)
-
+    
     optimizer = torch.optim.Adam(net.parameters(),lr=LR)
 
     for e in range(EPOCHS):
@@ -290,6 +242,7 @@ def train_EfficientNet():
 
             x = x.reshape(BSIZE,3,IMG_SIZE,IMG_SIZE)           
             out = net(x).reshape(BSIZE,25)
+
             kdo = torch.argmax(out.clone()[0].cpu().detach(),axis=-1)
             y=y.view(-1).long()
  
@@ -305,11 +258,33 @@ def train_EfficientNet():
             print(f"** Epoch: {e} |  Loss: {floss/nrm} ")
 
 
-env = os.getenv("RUN_MODE")
-assert(env != None)
-env = int(env)
-if(env == 1):
-    train_EfficientNet()
+def test_efficientNet():
+    
+    data =Dataset()
+    net = EfficientNet(b0[0],b0[1],b0[3],len(data.x))
+    net.load_state_dict(torch.load("./model.pth"))
+    img = load_and_scale_image("./crap.png").reshape(3,IMG_SIZE,IMG_SIZE)
+    loader = torch.utils.data.DataLoader(data,batch_size=BSIZE,shuffle=True)
 
+    for b,(x,y) in enumerate(loader):
+        
+        x =x.reshape(BSIZE,3,IMG_SIZE,IMG_SIZE)
+        
+        out = net(x)
+        out = out.clone().cpu().detach()[0]
+        out = torch.argmax(out,axis=-1).numpy().tolist()  
+
+        closest_neighbour = data.get_embedding_item(x,out)
+        cv2.imwrite("./test.png",closest_neighbour.numpy())       
+       
+        break
+
+env = os.getenv("RUN_MODE")
+if(env != None):
+    env = int(env)
+    if(env == 1):
+        train_EfficientNet()
+    else:
+        test_efficientNet()
 
 

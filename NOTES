@@ -1,0 +1,24 @@
+
+
+how does vector embedding work? 
+
+you have your image.
+and then classes with possible similar features
+like your image.
+
+find them.
+
+
+How to find similar  X with info that X belongs to second class (K) 
+  
+np.mean would work right? 
+
+but really and actually, no.
+
+What can work is just substracting pixels i guess and finding mean num of those.
+
+BUT OUR MODEL HAS TO ACTUALLY PREDICT SMTN RIGHT?
+
+
+
+

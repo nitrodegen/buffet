@@ -3,11 +3,12 @@ import torch.nn as nn
 import torch
 import numpy as np
 import cv2
+import time
 from math import * 
 
 # *** constants *** 
 EPOCHS= 120
-LR=0.0001
+LR=0.001
 MAX_IMG_PER_FOLDER = int(os.getenv("MAXIMG")) # we need to limit this ,cause M1 is not that powerful.
 BSIZE = int(os.getenv("BSIZE"))
 NUM_OF_CLASSES = 25
@@ -24,7 +25,7 @@ class Dataset(torch.utils.data.Dataset):
     def __init__(self) -> None:
         super().__init__()
 
-        self.precision  = 0.5
+        self.precision  = 0.3
         self.x = [] 
         self.y = [] 
         
@@ -39,47 +40,62 @@ class Dataset(torch.utils.data.Dataset):
             for i in range(MAX_IMG_PER_FOLDER):
                 img = folder_dir[i]
                 img = load_and_scale_image(DATA_FOLDER+folder+"/"+img)
-             
+                img/=255
+
                 self.x.append(img)
                 self.y.append(np.array([omk]))
                 
             omk+=1
 
-        self.embedding_vector  = [[ ] for i in range(omk)]
-        self.x = torch.tensor(np.array(self.x)).float()
-        self.y = torch.tensor(np.array(self.y)).float()
+        self.embedding_vector  = {
+            i:{i:None for i in range(MAX_IMG_PER_FOLDER)} for i in range(omk)
+        }
+
+        self.mapped_imgs = { 
+            i:[] for i in range(omk)
+        }
 
         for i in range(len(self.x)):
             x,y = self.__getitem__(i)
-            y= int(y.detach().numpy().tolist()[0])
-            self.embedding_vector[y].append(x.numpy())
 
-        self.embedding_vector = torch.tensor(np.array(self.embedding_vector))  
+            y= int(y.tolist()[0])
+            self.mapped_imgs[y].append(x)
+
+
+        self.x = torch.tensor(np.array(self.x)).float()
+        self.y = torch.tensor(np.array(self.y)).float()
+
+        indt = 0 
+
+        for i in range(0,len(self.x)):
+            if(indt >= MAX_IMG_PER_FOLDER):
+                indt = 0 
+
+            x,y = self.__getitem__(i)
+   
+            x = x.reshape(3,IMG_SIZE,IMG_SIZE)
+            y=int(y.detach().numpy().tolist()[0])
         
+        
+            calc_formula = torch.mean(x)
+            self.embedding_vector[y][indt] = calc_formula
+            indt+=1
+
 
     def get_embedding_item(self,img,img_class):
-        
-        img_mean_fin = torch.mean(img)
-        out = None
 
-        oud = self.embedding_vector[img_class]
-        
-        means = [] 
+        img = torch.mean(img)
+        img_class_cut = self.embedding_vector[img_class]
+        diffs = self.precision
+        indx = None 
+        for i in range(MAX_IMG_PER_FOLDER):
+            diff = abs(img-img_class_cut[i])
+            if(diff <= self.precision):
+                diffs = diff
+                indx = i 
 
-        for img in oud:
-            img_mean = torch.mean(img)
-            means.append(torch.abs(img_mean-img_mean_fin))
-
-        mind = means[0]
-        indx = 0 
-        for i in range(len(means)):
-            if(means[i] < mind):
-                mind = means[i]
-                indx = i
-
-        return self.embedding_vector[img_class][indx]
-    
-
+        indx = self.mapped_imgs[img_class][indx]
+        return indx
 
 
     def __len__(self):

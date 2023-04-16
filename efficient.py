@@ -229,7 +229,7 @@ def train_EfficientNet():
 
     data =Dataset()
     net = EfficientNet(b0[0],b0[1],b0[3],len(data.x))
-    img = load_and_scale_image("./crap.png").reshape(3,IMG_SIZE,IMG_SIZE)
+   # img = load_and_scale_image("./crap.png").reshape(3,IMG_SIZE,IMG_SIZE)
     loader = torch.utils.data.DataLoader(data,batch_size=BSIZE,shuffle=True)
     
     optimizer = torch.optim.Adam(net.parameters(),lr=LR)
@@ -256,14 +256,18 @@ def train_EfficientNet():
             floss+=ls.item()
             nrm+=1
             print(f"** Epoch: {e} |  Loss: {floss/nrm} ")
-
+    
+    torch.save(net.state_dict(),"./test.pth")
 
 def test_efficientNet():
     
+    dt = time.time()
     data =Dataset()
+    od = time.time()
+    print("loading time (dataset):",(od-dt), "secs")
     net = EfficientNet(b0[0],b0[1],b0[3],len(data.x))
     net.load_state_dict(torch.load("./model.pth"))
-    img = load_and_scale_image("./crap.png").reshape(3,IMG_SIZE,IMG_SIZE)
+  #  img = load_and_scale_image("./crap.png").reshape(3,IMG_SIZE,IMG_SIZE)
     loader = torch.utils.data.DataLoader(data,batch_size=BSIZE,shuffle=True)
 
     for b,(x,y) in enumerate(loader):
@@ -273,11 +277,13 @@ def test_efficientNet():
         out = net(x)
         out = out.clone().cpu().detach()[0]
         out = torch.argmax(out,axis=-1).numpy().tolist()  
+        xd = x[0].numpy().reshape(IMG_SIZE,IMG_SIZE,3)*255
 
-        closest_neighbour = data.get_embedding_item(x,out)
-        cv2.imwrite("./test.png",closest_neighbour.numpy())       
-       
-        break
+        dt = time.time()
+        closest_neighbour = data.get_embedding_item(x[2],out)*255
+        od = time.time()
+        print("embedding vector time (ms):",(od-dt)*1000)
+
 
 env = os.getenv("RUN_MODE")
 if(env != None):
